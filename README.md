@@ -19,7 +19,7 @@ Run pretraining using by using the script `pretrain_FOLNet.sh`.
 
 # Model checkpoint
 - The model checkpoints can be downloaded from:
-[FOLNet-checkpoints](https://tencentoverseas-my.sharepoint.com/:f:/g/personal/jianshuchen_global_tencent_com/Em7QLOIa6bZGuqLoqylyow4BZrL-k3ZiWysXE7tiyyAxjA?e=bnAeH9)
+[FOLNet-checkpoints](https://tencentoverseas-my.sharepoint.com/:f:/g/personal/jianshuchen_global_tencent_com/Em7QLOIa6bZGuqLoqylyow4BZrL-k3ZiWysXE7tiyyAxjA?e=bnAeH9) or [FOLNet-checkpoints2](https://tencentoverseas-my.sharepoint.com/:f:/g/personal/xiaomanpan_global_tencent_com/EvRCMNsu1NRAlF7Uestta54BeKWJhDk_Gw_RNzdcMAwgSw?e=Kfi4Zw)
 - You need to have both the `*.cfg` file (model configuration) and the `*.pt` file (model file).
 
 # Reference
