@@ -1,13 +1,10 @@
+import math
+import numpy as np
+from scipy.linalg import toeplitz
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions.categorical import Categorical
-import math
-import copy
-import numpy as np
-from torch.nn import CrossEntropyLoss
-from scipy.linalg import toeplitz
-from itertools import permutations
 from config_folnet import FOLNetConfig
 
 
@@ -23,15 +20,67 @@ ACT2FN = {
 
 
 try:
-    import apex
-    import apex.normalization
     from apex.normalization.fused_layer_norm import FusedLayerNormAffineFunction
     from apex.normalization.fused_layer_norm import FusedLayerNormFunction
     APEX_IS_AVAILABLE = True and torch.cuda.is_available()
 except ImportError:
     print("Better speed can be achieved with Nvidia apex package")
     APEX_IS_AVAILABLE = False
+
+
+# initialization from pretrained model checkpoints
+# - Input arguments:
+#   - pretrained_model_path: the paths for pretrained model
+#   - config: the configuration of the model
+# - Return:
+#   - the model loaded from pretrained checkpoint
+def init_from_pretrained(cls, pretrained_model_path, config):
+    if config is None:
+        pretrained_config_path = pretrained_model_path + '.cfg'
+        config = FOLNetConfig.from_pretrained(pretrained_config_path)
+    model = cls(config)
+    model_dict = model.state_dict()
+    pretrained_dict = torch.load(
+        pretrained_model_path + '.pt',
+        map_location=torch.device('cpu')
+    )
+    src_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+    model_dict.update(src_dict)
+    model.load_state_dict(model_dict)
+    s = model.state_dict()
+    unused_keys = [k for k in pretrained_dict.keys() if k not in model_dict]
+    uninit_keys = [k for k in model_dict.keys() if k not in pretrained_dict]
+    failed_keys = [k for k, v in src_dict.items() if torch.norm(v.float() - s[k].float()) > 1e-6]
+    print("unused pretrained weights = {}".format(unused_keys))
+    print("randomly initialized weights = {}".format(uninit_keys))
+    print("unsuccessfully initialized weights = {}".format(failed_keys))
+    return model
+
+
+# initialize model weights for certain types of modules
+# - Input arguments
+#   - initializer_range: the range of initialization (std)
+def init_model_weights(module, initializer_range):
+    if isinstance(module, (nn.Linear, nn.Embedding)):
+        if initializer_range < 0:
+            init_std = math.sqrt(2.0/sum(list(module.weight.data.shape)))
+        else:
+            init_std = initializer_range
+        module.weight.data.normal_(mean=0.0, std=init_std)
+    elif isinstance(module, LayerNorm):
+        if module.bias is not None:
+            module.bias.data.zero_()
+        if module.weight is not None:
+            module.weight.data.fill_(1.0)
+    if isinstance(module, nn.Linear) and module.bias is not None:
+        module.bias.data.zero_()
+
+
+# Layer Normalization
+# This module is imported from apex that is fused version, and is more
+# numerically stable for mixed precision training
 class LayerNorm(nn.Module):
+
     def __init__(self, hidden_size, eps=1e-12, elementwise_affine=False):
         super(LayerNorm, self).__init__()
         self.elementwise_affine = elementwise_affine
@@ -66,6 +115,7 @@ class LayerNorm(nn.Module):
         return x
 
 
+# BertPredictionHeadTransform is a part of the operation / module for MLM head
 class BertPredictionHeadTransform(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -83,6 +133,7 @@ class BertPredictionHeadTransform(nn.Module):
         return hidden_states
 
 
+# BertLMPredictionHead is the MLM head
 class BertLMPredictionHead(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -98,6 +149,7 @@ class BertLMPredictionHead(nn.Module):
         return hidden_states
 
 
+# BertPreTrainingHeads is the module with MLM and NSP heads
 class BertPreTrainingHeads(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -110,6 +162,15 @@ class BertPreTrainingHeads(nn.Module):
         return prediction_scores, seq_relationship_score
 
 
+# The Encoder module is the part that takes tokens and other ids as the input
+# and then output the corresponding embeddings.
+# - Input arguments:
+#   - tok_seq: the token id sequence
+#   - tok_type_ids: the token type ids designating sequence #1 or #2 for NSP or
+#   SOP loss settings
+# - Output arguments:
+#    - (embd0, embd1, embd2): the tuples that contains the embeddings for the
+#    nullary, unary and binary predicates (the nullary one is always None)
 class Encoder(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -138,24 +199,14 @@ class Encoder(nn.Module):
         self.dropout = nn.Dropout(self.hidden_dropout_prob)
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            if self.initializer_range < 0:
-                init_std = math.sqrt(2.0/sum(list(module.weight.data.shape)))
-            else:
-                init_std = self.initializer_range
-            module.weight.data.normal_(mean=0.0, std=init_std)
-        elif isinstance(module, LayerNorm):
-            if module.bias is not None:
-                module.bias.data.zero_()
-            if module.weight is not None:
-                module.weight.data.fill_(1.0)
-        if isinstance(module, nn.Linear) and module.bias is not None:
-            module.bias.data.zero_()
+        init_model_weights(module, self.initializer_range)
 
     def init_weights(self):
         self.apply(self._init_weights)
 
     def create_relative_position_ids(self, seq_length):
+        # create relative position ids, which will be truncated if two tokens
+        # are too far apart (beyond a certain threshold)
         r = np.arange(0, seq_length, 1)
         r = np.clip(r, None, self.max_position_offset-1)
         c = np.arange(0, -seq_length, -1)
@@ -165,12 +216,14 @@ class Encoder(nn.Module):
         return rel_pos_ids
 
     def mask_relative_position_ids(self, rel_pos_ids, tok_type_ids):
+        # mask the relative position ids (some of the relative positions are
+        # not meaningful and will be masked out)
         batch_size = tok_type_ids.shape[0]
         dtype = tok_type_ids.dtype
         device = tok_type_ids.device
         rel_pos_ids = torch.tensor(rel_pos_ids, dtype=dtype, device=device)
         rel_pos_ids = rel_pos_ids.unsqueeze(0).expand(batch_size, -1, -1)
-        rel_pos_mask = (tok_type_ids.unsqueeze(-1)==tok_type_ids.unsqueeze(-2))
+        rel_pos_mask = (tok_type_ids.unsqueeze(-1) == tok_type_ids.unsqueeze(-2))
         rel_pos_mask = rel_pos_mask.to(dtype)
         rel_pos_ids = rel_pos_ids * rel_pos_mask
         rel_pos_ids = rel_pos_ids + (1-rel_pos_mask)*self.max_position_offset
@@ -223,10 +276,19 @@ class Encoder(nn.Module):
         return base_predicates
 
 
+# LogicOperator is the base class for all the remaining neural logic operator
+# classes. It defines the forward function format and the child classes only
+# need to define the _logic_op method.
+# - Attributes:
+#   - arity: the output arity of the operator (e.g., if the output is a binary
+#   predicates, then the arity is 2)
+#   - reader: the linear projections for the predicates of each arity
+#   - writer: the linear projection that is applied to the output before
+#   writing back into the residual streams
 class LogicOperator(nn.Module):
     def __init__(self, config, arity):
         super().__init__()
-        self.arity = arity # output arity
+        self.arity = arity  # output arity
         self.reader = (None, None, None)
         self.writer = None
 
@@ -241,36 +303,11 @@ class LogicOperator(nn.Module):
         return output_predicates
 
 
-class GlobalOperator(nn.Module):
+# cjoin (c): U <- U x B
+class ConjugateJoinOperator(nn.Module):  # based on new operator abstraction
     def __init__(self, config, arity):
         super().__init__()
-        self.arity = arity # output arity
-        self.i_kernel = None
-        self.i_premise = None
-        self.kernel = None
-        self.premise = None
-        self.writer = None
-
-    def reader(self, x):
-        kernel = self.kernel(x[self.i_kernel])
-        premise = self.premise(x[self.i_premise])
-        return kernel, premise
-
-    def _logic_op(self, kernel, premise):
-        raise NotImplementedError()
-        return predicates
-
-    def forward(self, input_predicates):
-        kernel, premise = self.reader(input_predicates)
-        predicates = self._logic_op(kernel, premise)
-        output_predicates = self.writer(predicates)
-        return output_predicates
-
-
-class ConjugateJoinOperator(nn.Module): # based on new operator abstraction
-    def __init__(self, config, arity):
-        super().__init__()
-        self.arity = arity # output arity
+        self.arity = arity  # output arity
         dims = config.predicate_dims
         self.i_kernel = 1
         self.i_premise = 2
@@ -286,8 +323,8 @@ class ConjugateJoinOperator(nn.Module): # based on new operator abstraction
         self.kernel = nn.Linear(dims[1], self.kernel_size, bias=False)
         self.premise = nn.Linear(dims[2], self.premise_size)
         self.output = nn.Linear(self.output_size, dims[1])
-        self.act_fun = nn.Softmax(dim=-1) # Softmax/Identity
-        self.dropout = nn.Dropout(config.hidden_dropout_prob) # dropout/Identity
+        self.act_fun = nn.Softmax(dim=-1)  # Softmax/Identity
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)  # dropout/Identity
 
     def reader(self, x):
         kernel = self.kernel(x[self.i_kernel])
@@ -317,6 +354,7 @@ class ConjugateJoinOperator(nn.Module): # based on new operator abstraction
         return output_predicates
 
 
+# join (j): U <- B x U
 class JoinOperator(LogicOperator):
     def __init__(self, config, arity):
         super().__init__(config, arity)
@@ -347,282 +385,7 @@ class JoinOperator(LogicOperator):
         return output_predicates
 
 
-class JoinWithRpeOperator(LogicOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        predicate_dims = config.predicate_dims
-        self.max_position_offset = config.max_position_offset
-        self.num_heads = config.num_heads
-        self.head_size = config.head_size
-        self.all_size = self.num_heads * self.head_size
-        self.reader = nn.ModuleList([
-            nn.Identity(),
-            nn.Linear(predicate_dims[1], self.all_size),
-            nn.Linear(predicate_dims[2], self.num_heads, bias=False)
-        ])
-        self.writer = nn.Linear(self.all_size, predicate_dims[1])
-        num_relative_positions = 2 * self.max_position_offset + 2
-        self.rel_pos_embd = nn.Embedding(num_relative_positions, self.head_size)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-    def create_relative_position_ids(self, seq_length):
-        r = np.arange(0, seq_length, 1)
-        r = np.clip(r, None, self.max_position_offset-1)
-        c = np.arange(0, -seq_length, -1)
-        c = np.clip(c, -self.max_position_offset+1, None)
-        c[1:] += 2 * self.max_position_offset
-        rel_pos_ids = toeplitz(c, r)
-        return rel_pos_ids
-
-    def _logic_op(self, input_predicates):
-        batch_size = input_predicates[1].shape[0]
-        seq_length = input_predicates[1].shape[1]
-        value = input_predicates[1]
-        value = value.view(value.shape[:-1] + (self.num_heads, self.head_size))
-        value = value.permute(0, 2, 1, 3)
-        attention_scores = input_predicates[2]
-        attention_scores = attention_scores.permute(0, 3, 1, 2)
-        attention_probs = nn.Softmax(dim=-1)(attention_scores)
-        attention_probs = self.dropout(attention_probs)
-        predicates = torch.matmul(attention_probs, value)
-        rpe_ids = self.create_relative_position_ids(seq_length)
-        rpe_ids = torch.tensor(rpe_ids, dtype=torch.long, device=value.device)
-        rpe = self.rel_pos_embd(rpe_ids)
-        new_shape = (batch_size*self.num_heads, seq_length, seq_length)
-        _attention_probs = attention_probs.view(new_shape)
-        _attention_probs = _attention_probs.permute(1, 0, 2)
-        rpe_bias = torch.matmul(_attention_probs, rpe)
-        new_shape = (seq_length, batch_size, self.num_heads, self.head_size)
-        rpe_bias = rpe_bias.view(new_shape)
-        rpe_bias = rpe_bias.permute(1, 2, 0, 3)
-        predicates = predicates + rpe_bias
-        output_predicates = predicates.permute(0, 2, 1, 3).contiguous()
-        new_shape = output_predicates.shape[:-2] + (self.all_size,)
-        output_predicates = output_predicates.view(*new_shape)
-        return output_predicates
-
-
-class ScatterOperator(GlobalOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 1
-        dims = config.predicate_dims
-        self.i_kernel = 1
-        self.i_premise = 0
-        self.num_heads = config.num_heads
-        self.head_size = config.head_size
-        self.glob_size = config.glob_size
-        self.all_size = self.num_heads * self.head_size
-        self.kernel_size = self.num_heads * self.glob_size
-        self.premise_size = self.num_heads * self.head_size
-        self.kernel = nn.Linear(dims[1], self.kernel_size, bias=False)
-        self.premise = nn.Linear(dims[0], self.premise_size, bias=False)
-        self.writer = nn.Linear(self.all_size, dims[1])
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-    def _logic_op(self, kernel, premise):
-        new_shape = kernel.shape[:-1] + (self.num_heads, self.glob_size)
-        kernel = kernel.view(new_shape)
-        kernel = kernel.permute(0, 2, 1, 3)
-        kernel = nn.Softmax(dim=-1)(kernel)
-        kernel = self.dropout(kernel)
-        new_shape = premise.shape[:-1] + (self.num_heads, self.head_size)
-        premise = premise.view(new_shape)
-        premise = premise.permute(0, 2, 1, 3)
-        predicates = torch.matmul(kernel, premise)
-        predicates = predicates.permute(0, 2, 1, 3).contiguous()
-        predicates = predicates.view(predicates.shape[:-2]+(-1,))
-        return predicates
-
-
-class Scatter2Operator(GlobalOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 2
-        dims = config.predicate_dims
-        self.i_kernel = 2
-        self.i_premise = 0
-        self.glob_size = config.glob_size
-        self.num_heads = int(max(dims[2]/self.glob_size, 1.0))
-        self.head_size = int(dims[2]/self.num_heads)
-        self.kernel_size = self.num_heads * self.glob_size
-        self.premise_size = self.num_heads * self.head_size
-        self.all_size = self.num_heads * self.head_size
-        self.kernel = nn.Linear(dims[2], self.kernel_size, bias=False)
-        self.premise = nn.Linear(dims[0], self.premise_size, bias=False)
-        self.writer = nn.Linear(self.all_size, dims[2])
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-    def _logic_op(self, kernel, premise):
-        orig_shape = kernel.shape
-        new_shape = (kernel.shape[0], -1, self.num_heads, self.glob_size)
-        kernel = kernel.view(new_shape)
-        kernel = kernel.permute(0, 2, 1, 3)
-        kernel = nn.Softmax(dim=-1)(kernel)
-        kernel = self.dropout(kernel)
-        new_shape = premise.shape[:-1] + (self.num_heads, self.head_size)
-        premise = premise.view(new_shape)
-        premise = premise.permute(0, 2, 1, 3)
-        predicates = torch.matmul(kernel, premise)
-        predicates = predicates.permute(0, 2, 1, 3)
-        predicates = predicates.contiguous()
-        predicates = predicates.view(orig_shape[:-1] + (-1,))
-        return predicates
-
-
-class GatherOperator(GlobalOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 0
-        dims = config.predicate_dims
-        self.i_kernel = 1
-        self.i_premise = 1
-        self.num_heads = config.num_heads
-        self.head_size = config.head_size
-        self.glob_size = config.glob_size
-        self.kernel_size = self.num_heads * self.glob_size
-        self.premise_size = self.num_heads * self.head_size
-        self.all_size = self.num_heads * self.head_size
-        self.kernel = nn.Linear(dims[1], self.kernel_size, bias=False)
-        self.premise = nn.Linear(dims[1], self.premise_size, bias=False)
-        self.writer = nn.Linear(self.all_size, dims[0])
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-    def _logic_op(self, kernel, premise):
-        new_shape = kernel.shape[:-1] + (self.num_heads, self.glob_size)
-        kernel = kernel.view(new_shape)
-        kernel = kernel.permute(0, 2, 3, 1)
-        kernel = nn.Softmax(dim=-1)(kernel)
-        kernel = self.dropout(kernel)
-        new_shape = premise.shape[:-1] + (self.num_heads, self.head_size)
-        premise = premise.view(new_shape)
-        premise = premise.permute(0, 2, 1, 3)
-        predicates = torch.matmul(kernel, premise)
-        predicates = predicates.permute(0, 2, 1, 3).contiguous()
-        predicates = predicates.view(predicates.shape[:-2]+(-1,))
-        return predicates
-
-
-class Gather2Operator(GlobalOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 0
-        dims = config.predicate_dims
-        self.i_kernel = 2
-        self.i_premise = 2
-        self.glob_size = config.glob_size
-        self.num_heads = int(max(dims[2]/self.glob_size, 1.0))
-        self.head_size = int(dims[2]/self.num_heads)
-        self.kernel_size = self.num_heads * self.glob_size
-        self.premise_size = self.num_heads * self.head_size
-        self.all_size = self.num_heads * self.head_size
-        self.kernel = nn.Linear(dims[2], self.kernel_size, bias=False)
-        self.premise = nn.Linear(dims[2], self.premise_size, bias=False)
-        self.writer = nn.Linear(self.all_size, dims[0])
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-    def _logic_op(self, kernel, premise):
-        new_shape = (kernel.shape[0], -1, self.num_heads, self.glob_size)
-        kernel = kernel.view(new_shape)
-        kernel = kernel.permute(0, 2, 3, 1)
-        kernel = nn.Softmax(dim=-1)(kernel)
-        kernel = self.dropout(kernel)
-        new_shape = (premise.shape[0], -1, self.num_heads, self.head_size)
-        premise = premise.view(new_shape)
-        premise = premise.permute(0, 2, 1, 3)
-        predicates = torch.matmul(kernel, premise)
-        predicates = predicates.permute(0, 2, 1, 3)
-        predicates = predicates.contiguous()
-        predicates = predicates.view(predicates.shape[:-2] + (-1,))
-        return predicates
-
-
-class LambdaOperator(LogicOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 2
-        predicate_dims = config.predicate_dims
-        self.reader = nn.ModuleList([
-            nn.Linear(predicate_dims[arity-1], predicate_dims[arity])
-            if r == arity-1 else nn.Identity()
-            for r in range(len(config.mixer_ops))
-        ])
-        self.writer = nn.Identity()
-
-    def _logic_op(self, input_predicates):
-        predicates = input_predicates[self.arity-1]
-        new_shape = input_predicates[self.arity].shape
-        output_predicates = predicates.unsqueeze(-2).expand(*new_shape)
-        return output_predicates
-
-
-class ExpandOperator(LogicOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 2
-        predicate_dims = config.predicate_dims
-        self.max_span = config.max_span
-        self.span_dim = predicate_dims[2]
-        self.all_size = self.max_span * self.span_dim
-        self.reader = nn.ModuleList([
-            nn.Identity(),
-            nn.Linear(predicate_dims[1], self.all_size),
-            nn.Identity()
-        ])
-        self.writer = nn.Identity()
-
-    def _logic_op(self, input_predicates):
-        predicates = input_predicates[1]
-        batch_size = predicates.shape[0]
-        seq_length = predicates.shape[1]
-        device = predicates.device
-        dtype = predicates.dtype
-        new_shape = (batch_size, seq_length, self.max_span, self.span_dim)
-        predicates = predicates.view(new_shape)
-        _t = torch.arange(seq_length, dtype=torch.long, device=device)
-        _s = torch.arange(self.max_span, dtype=torch.long, device=device)
-        scatter_index = (_t.unsqueeze(-1) + _s.unsqueeze(0)) % seq_length
-        scatter_index = scatter_index.unsqueeze(-1).unsqueeze(0)
-        scatter_index = scatter_index.expand(batch_size, -1, -1, self.span_dim)
-        target_shape = (batch_size, seq_length, seq_length, self.span_dim)
-        _zeros = torch.zeros(target_shape, device=device, dtype=dtype)
-        output_predicates = _zeros.scatter_(2, scatter_index, predicates)
-        return output_predicates
-
-
-class ReduceOperator(LogicOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 1
-        predicate_dims = config.predicate_dims
-        self.max_span = config.max_span
-        self.reader = nn.ModuleList([
-            nn.Identity(),
-            nn.Identity(),
-            nn.Identity()
-        ])
-        self.writer = nn.Linear(
-            self.max_span*predicate_dims[2],
-            predicate_dims[1]
-        )
-
-    def _logic_op(self, input_predicates):
-        predicates = input_predicates[2]
-        batch_size = predicates.shape[0]
-        seq_length = predicates.shape[1]
-        predicate_dim = predicates.shape[-1]
-        device = predicates.device
-        dtype = predicates.dtype
-        _t = torch.arange(seq_length, dtype=torch.long, device=device)
-        _s = torch.arange(self.max_span, dtype=torch.long, device=device)
-        gather_index = (_t.unsqueeze(-1) + _s.unsqueeze(0)) % seq_length
-        gather_index = gather_index.unsqueeze(-1).unsqueeze(0)
-        gather_index = gather_index.expand(batch_size, -1, -1, predicate_dim)
-        predicates = predicates.gather(2, gather_index)
-        output_predicates = predicates.view(predicates.shape[:2] + (-1,))
-        return output_predicates
-
-
+# mu (m): U <- B x B
 class MuOperator(LogicOperator):
     def __init__(self, config, arity):
         super().__init__(config, arity)
@@ -654,24 +417,7 @@ class MuOperator(LogicOperator):
         return output_predicates
 
 
-class QuantificationOperator(LogicOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity < 2
-        predicate_dims = config.predicate_dims
-        self.reader = nn.ModuleList([
-            nn.Linear(predicate_dims[r], predicate_dims[r])
-            if r == arity + 1 else nn.Identity()
-            for r in range(len(config.mixer_ops))
-        ])
-        self.writer = nn.Linear(predicate_dims[arity+1], predicate_dims[arity])
-
-    def _logic_op(self, input_predicates):
-        predicates = input_predicates[self.arity+1]
-        output_predicates = predicates.max(dim=-2)[0]
-        return output_predicates
-
-
+# assoc (a): B <- U x U
 class AssociativeOperator(LogicOperator):
     def __init__(self, config, arity):
         super().__init__(config, arity)
@@ -704,371 +450,7 @@ class AssociativeOperator(LogicOperator):
         return output_predicates
 
 
-class AssociativeWithSoftmaxOperator(LogicOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 2
-        predicate_dims = config.predicate_dims
-        self.num_heads = config.num_heads
-        self.head_size = config.head_size
-        self.all_size = self.num_heads * self.head_size
-        self.reader = nn.ModuleList([
-            nn.Identity(),
-            nn.Linear(predicate_dims[1], self.all_size*2, bias=False),
-            nn.Identity()
-        ])
-        self.writer = nn.Linear(self.num_heads, predicate_dims[2])
-
-    def transpose_for_association(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_heads, self.head_size)
-        x = x.view(*new_x_shape)
-        return x.transpose(-2, -3)
-
-    def _logic_op(self, input_predicates):
-        unary_predicates = input_predicates[1]
-        query = unary_predicates[:, :, :self.all_size]
-        query = self.transpose_for_association(query)
-        query = nn.Softmax(dim=-1)(query)
-        key = unary_predicates[:, :, self.all_size:]
-        key = self.transpose_for_association(key)
-        predicates = torch.matmul(query, key.transpose(-1, -2))
-        output_predicates = predicates.permute(0, 2, 3, 1)
-        return output_predicates
-
-
-class AssociativeWithRpeOperator(LogicOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 2
-        predicate_dims = config.predicate_dims
-        self.max_position_offset = config.max_position_offset
-        self.num_heads = config.num_heads
-        self.head_size = config.head_size
-        self.all_size = self.num_heads * self.head_size
-        self.reader = nn.ModuleList([
-            nn.Identity(),
-            nn.Linear(predicate_dims[1], self.all_size*2),
-            nn.Identity()
-        ])
-        self.writer = nn.Linear(self.num_heads, predicate_dims[2])
-        num_relative_positions = 2 * self.max_position_offset + 2
-        self.rel_pos_embd = nn.Embedding(num_relative_positions, self.head_size)
-
-    def transpose_for_association(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_heads, self.head_size)
-        x = x.view(*new_x_shape)
-        return x.transpose(-2, -3)
-
-    def create_relative_position_ids(self, seq_length):
-        r = np.arange(0, seq_length, 1)
-        r = np.clip(r, None, self.max_position_offset-1)
-        c = np.arange(0, -seq_length, -1)
-        c = np.clip(c, -self.max_position_offset+1, None)
-        c[1:] += 2 * self.max_position_offset
-        rel_pos_ids = toeplitz(c, r)
-        return rel_pos_ids
-
-    def _logic_op(self, input_predicates):
-        batch_size = input_predicates[1].shape[0]
-        seq_length = input_predicates[1].shape[1]
-        unary_predicates = input_predicates[1]
-        scaling = math.sqrt(math.sqrt(self.head_size))
-        query = unary_predicates[:, :, :self.all_size] / scaling
-        query = self.transpose_for_association(query)
-        key = unary_predicates[:, :, self.all_size:] / scaling
-        key = self.transpose_for_association(key)
-        predicates = torch.matmul(query, key.transpose(-1, -2))
-        rpe_ids = self.create_relative_position_ids(seq_length)
-        rpe_ids = torch.tensor(rpe_ids, dtype=torch.long, device=query.device)
-        rpe = self.rel_pos_embd(rpe_ids) / scaling
-        new_shape = (batch_size*self.num_heads, seq_length, self.head_size)
-        _query = query.contiguous()
-        _query = _query.view(new_shape)
-        _query = _query.permute(1, 0, 2)
-        rpe_bias = torch.matmul(rpe, _query.transpose(-1, -2))
-        new_shape = (seq_length, seq_length, batch_size, self.num_heads)
-        rpe_bias = rpe_bias.view(new_shape)
-        rpe_bias = rpe_bias.permute(2, 3, 0, 1)
-        predicates = predicates + rpe_bias
-        output_predicates = predicates.permute(0, 2, 3, 1)
-        return output_predicates
-
-
-class AssociativeWithLayerNormOperator(GlobalOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 2
-        dims = config.predicate_dims
-        self.i_kernel = 1
-        self.i_premise = 1
-        self.num_heads = config.num_heads
-        self.head_size = config.head_size
-        self.kernel_size = self.num_heads * self.head_size
-        self.premise_size = self.num_heads * self.head_size
-        self.all_size = self.num_heads
-        self.kernel = nn.Linear(dims[1], self.kernel_size)
-        self.premise = nn.Linear(dims[1], self.premise_size)
-        self.writer = nn.Linear(self.all_size, dims[2])
-        self.LayerNorm = LayerNorm(self.head_size, eps=config.layer_norm_eps)
-
-    def transpose_for_association(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_heads, self.head_size)
-        x = x.view(*new_x_shape)
-        return x.transpose(-2, -3)
-
-    def _logic_op(self, kernel, premise):
-        kernel = self.transpose_for_association(kernel)
-        kernel = self.LayerNorm(kernel)
-        premise = self.transpose_for_association(premise)
-        predicates = torch.matmul(kernel, premise.transpose(-1, -2))
-        predicates = predicates.permute(0, 2, 3, 1)
-        return predicates
-
-
-class LinkOperator(GlobalOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 1
-        dims = config.predicate_dims
-        self.i_kernel = 0
-        self.i_premise = 1
-        self.num_heads = config.num_heads
-        self.head_size = config.head_size
-        self.glob_size = config.glob_size
-        self.kernel_size = self.num_heads * self.head_size
-        self.premise_size = self.num_heads * self.head_size
-        self.all_size = self.num_heads * self.glob_size
-        self.kernel = nn.Linear(dims[0], self.kernel_size)
-        self.premise = nn.Linear(dims[1], self.premise_size)
-        self.writer = nn.Linear(self.all_size, dims[1])
-
-    def transpose_for_association(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_heads, self.head_size)
-        x = x.view(*new_x_shape)
-        return x.transpose(-2, -3)
-
-    def _logic_op(self, kernel, premise):
-        scaling = math.sqrt(math.sqrt(self.head_size))
-        kernel = kernel / scaling
-        kernel = self.transpose_for_association(kernel)
-        premise = premise / scaling
-        premise = self.transpose_for_association(premise)
-        predicates = torch.matmul(kernel, premise.transpose(-1, -2))
-        predicates = predicates.permute(0, 3, 1, 2).contiguous()
-        predicates = predicates.view(predicates.shape[:-2] + (-1,))
-        return predicates
-
-class LinkWithLayerNormOperator(GlobalOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 1
-        dims = config.predicate_dims
-        self.i_kernel = 0
-        self.i_premise = 1
-        self.num_heads = config.num_heads
-        self.head_size = config.head_size
-        self.glob_size = config.glob_size
-        self.kernel_size = self.num_heads * self.head_size
-        self.premise_size = self.num_heads * self.head_size
-        self.all_size = self.num_heads * self.glob_size
-        self.kernel = nn.Linear(dims[0], self.kernel_size)
-        self.premise = nn.Linear(dims[1], self.premise_size)
-        self.writer = nn.Linear(self.all_size, dims[1])
-        self.LayerNorm = LayerNorm(self.head_size, eps=config.layer_norm_eps)
-
-    def transpose_for_association(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_heads, self.head_size)
-        x = x.view(*new_x_shape)
-        return x.transpose(-2, -3)
-
-    def _logic_op(self, kernel, premise):
-        kernel = self.transpose_for_association(kernel)
-        kernel = self.LayerNorm(kernel)
-        premise = self.transpose_for_association(premise)
-        predicates = torch.matmul(kernel, premise.transpose(-1, -2))
-        predicates = predicates.permute(0, 3, 1, 2).contiguous()
-        predicates = predicates.view(predicates.shape[:-2] + (-1,))
-        return predicates
-
-
-
-class Link2Operator(GlobalOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 2
-        dims = config.predicate_dims
-        self.i_kernel = 0
-        self.i_premise = 2
-        self.glob_size = config.glob_size
-        self.num_heads = int(max(dims[2]/self.glob_size, 1.0))
-        self.head_size = dims[2]
-        self.kernel_size = self.num_heads * self.head_size
-        self.premise_size = self.head_size
-        self.all_size = self.num_heads * self.glob_size
-        self.kernel = nn.Linear(dims[0], self.kernel_size)
-        self.premise = nn.Linear(dims[2], self.premise_size)
-        self.writer = nn.Linear(self.all_size, dims[2])
-
-    def transpose_for_association(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_heads, self.head_size)
-        x = x.view(*new_x_shape)
-        return x.transpose(-2, -3)
-
-    def _logic_op(self, kernel, premise):
-        orig_shape = premise.shape
-        scaling = math.sqrt(math.sqrt(self.head_size))
-        kernel = kernel / scaling
-        kernel = self.transpose_for_association(kernel)
-        kernel = kernel.contiguous()
-        kernel = kernel.view(kernel.shape[0], -1, kernel.shape[-1])
-        premise = premise / scaling
-        premise = premise.view(premise.shape[0], -1, premise.shape[-1])
-        predicates = torch.matmul(kernel, premise.transpose(-1, -2))
-        predicates = predicates.permute(0, 2, 1)
-        predicates = predicates.view(orig_shape[:-1] + (-1,))
-        return predicates
-
-class Link2WithLayerNormOperator(GlobalOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 2
-        dims = config.predicate_dims
-        self.i_kernel = 0
-        self.i_premise = 2
-        self.glob_size = config.glob_size
-        self.num_heads = int(max(dims[2]/self.glob_size, 1.0))
-        self.head_size = dims[2]
-        self.kernel_size = self.num_heads * self.head_size
-        self.premise_size = self.head_size
-        self.all_size = self.num_heads * self.glob_size
-        self.kernel = nn.Linear(dims[0], self.kernel_size)
-        self.premise = nn.Linear(dims[2], self.premise_size)
-        self.writer = nn.Linear(self.all_size, dims[2])
-        self.LayerNorm = LayerNorm(self.head_size, eps=config.layer_norm_eps)
-
-    def transpose_for_association(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_heads, self.head_size)
-        x = x.view(*new_x_shape)
-        return x.transpose(-2, -3)
-
-    def _logic_op(self, kernel, premise):
-        orig_shape = premise.shape
-        kernel = self.transpose_for_association(kernel)
-        kernel = kernel.contiguous()
-        kernel = kernel.view(kernel.shape[0], -1, kernel.shape[-1])
-        kernel = self.LayerNorm(kernel)
-        premise = premise.view(premise.shape[0], -1, premise.shape[-1])
-        predicates = torch.matmul(kernel, premise.transpose(-1, -2))
-        predicates = predicates.permute(0, 2, 1)
-        predicates = predicates.view(orig_shape[:-1] + (-1,))
-        return predicates
-
-
-
-class ReflectionOperator(GlobalOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 0
-        dims = config.predicate_dims
-        self.i_kernel = 0
-        self.i_premise = 0
-        self.num_heads = config.num_heads
-        self.head_size = config.head_size
-        self.glob_size = config.glob_size
-        self.kernel_size = self.num_heads * self.head_size
-        self.premise_size = self.num_heads * self.head_size
-        self.all_size = 2 * self.num_heads * self.glob_size
-        self.kernel = nn.Linear(dims[0], self.kernel_size)
-        self.premise = nn.Linear(dims[0], self.premise_size)
-        self.writer = nn.Linear(self.all_size, dims[0])
-
-    def transpose_for_association(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_heads, self.head_size)
-        x = x.view(*new_x_shape)
-        return x.transpose(-2, -3)
-
-    def _logic_op(self, kernel, premise):
-        scaling = math.sqrt(math.sqrt(self.head_size))
-        kernel = kernel / scaling
-        kernel = self.transpose_for_association(kernel)
-        premise = premise / scaling
-        premise = self.transpose_for_association(premise)
-        predicates = torch.matmul(kernel, premise.transpose(-1, -2))
-        p0 = predicates.permute(0, 3, 1, 2).contiguous()
-        p1 = predicates.permute(0, 2, 1, 3).contiguous()
-        predicates = torch.cat((p0, p1), dim=-1)
-        predicates = predicates.view(predicates.shape[:-2] + (-1,))
-        return predicates
-
-class ReflectionWithLayerNormOperator(GlobalOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 0
-        dims = config.predicate_dims
-        self.i_kernel = 0
-        self.i_premise = 0
-        self.num_heads = config.num_heads
-        self.head_size = config.head_size
-        self.glob_size = config.glob_size
-        self.kernel_size = self.num_heads * self.head_size
-        self.premise_size = self.num_heads * self.head_size
-        self.all_size = 2 * self.num_heads * self.glob_size
-        self.kernel = nn.Linear(dims[0], self.kernel_size)
-        self.premise = nn.Linear(dims[0], self.premise_size)
-        self.writer = nn.Linear(self.all_size, dims[0])
-        self.LayerNorm = LayerNorm(self.head_size, eps=config.layer_norm_eps)
-
-    def transpose_for_association(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_heads, self.head_size)
-        x = x.view(*new_x_shape)
-        return x.transpose(-2, -3)
-
-    def _logic_op(self, kernel, premise):
-        kernel = self.transpose_for_association(kernel)
-        kernel = self.LayerNorm(kernel)
-        premise = self.transpose_for_association(premise)
-        predicates = torch.matmul(kernel, premise.transpose(-1, -2))
-        p0 = predicates.permute(0, 3, 1, 2).contiguous()
-        p1 = predicates.permute(0, 2, 1, 3).contiguous()
-        predicates = torch.cat((p0, p1), dim=-1)
-        predicates = predicates.view(predicates.shape[:-2] + (-1,))
-        return predicates
-
-
-
-class FuseOperator(GlobalOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 0
-        dims = config.predicate_dims
-        self.i_kernel = 0
-        self.i_premise = 0
-        self.num_heads = config.num_heads
-        self.head_size = config.head_size
-        self.glob_size = config.glob_size
-        self.kernel_size = self.num_heads * self.glob_size
-        self.premise_size = self.num_heads * self.head_size
-        self.all_size = self.num_heads * self.head_size
-        self.kernel = nn.Linear(dims[0], self.kernel_size, bias=False)
-        self.premise = nn.Linear(dims[0], self.premise_size, bias=False)
-        self.writer = nn.Linear(self.all_size, dims[0])
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-    def _logic_op(self, kernel, premise):
-        new_shape = kernel.shape[:-1] + (self.num_heads, self.glob_size)
-        kernel = kernel.view(new_shape)
-        kernel = kernel.permute(0, 2, 1, 3)
-        kernel = nn.Softmax(dim=-1)(kernel)
-        kernel = self.dropout(kernel)
-        new_shape = premise.shape[:-1] + (self.num_heads, self.head_size)
-        premise = premise.view(new_shape)
-        premise = premise.permute(0, 2, 1, 3)
-        predicates = torch.matmul(kernel, premise)
-        predicates = predicates.permute(0, 2, 1, 3).contiguous()
-        predicates = predicates.view(predicates.shape[:-2]+(-1,))
-        return predicates
-
-
+# prod (p): B <- U x B
 class ProductOperator(LogicOperator):
     def __init__(self, config, arity):
         super().__init__(config, arity)
@@ -1096,60 +478,7 @@ class ProductOperator(LogicOperator):
         return output_predicates
 
 
-class ProductWithSoftmaxOperator(LogicOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 2
-        predicate_dims = config.predicate_dims
-        self.num_heads = config.num_heads
-        self.head_size = config.head_size
-        self.all_size = self.num_heads * self.head_size
-        self.reader = nn.ModuleList([
-            nn.Identity(),
-            nn.Linear(predicate_dims[1], self.all_size, bias=False),
-            nn.Linear(predicate_dims[2], self.head_size, bias=False)
-        ])
-        self.writer = nn.Linear(self.num_heads, predicate_dims[2])
-
-    def _logic_op(self, input_predicates):
-        unary_predicates = input_predicates[1]
-        binary_predicates = input_predicates[2]
-        query = unary_predicates
-        query = query.view(query.shape[:-1]+(self.num_heads, self.head_size))
-        query_ = nn.Softmax(dim=-1)(query)
-        key = binary_predicates
-        key_ = nn.Softmax(dim=-1)(key)
-        predicates = torch.matmul(query_, key.transpose(-1, -2))
-        predicates = predicates + torch.matmul(query, key_.transpose(-1, -2))
-        output_predicates = predicates.permute(0, 1, 3, 2)
-        return output_predicates
-
-
-class ProductWithLayerNormOperator(GlobalOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 2
-        dims = config.predicate_dims
-        self.i_kernel = 1
-        self.i_premise = 2
-        self.num_heads = config.num_heads
-        self.head_size = config.head_size
-        self.kernel_size = self.num_heads * self.head_size
-        self.premise_size = self.head_size
-        self.all_size = self.num_heads
-        self.kernel = nn.Linear(dims[1], self.kernel_size)
-        self.premise = nn.Linear(dims[2], self.premise_size)
-        self.writer = nn.Linear(self.all_size, dims[2])
-        self.LayerNorm = LayerNorm(self.head_size, eps=config.layer_norm_eps)
-
-    def _logic_op(self, kernel, premise):
-        kernel = kernel.view(kernel.shape[:-1]+(self.num_heads, self.head_size))
-        kernel = self.LayerNorm(kernel)
-        predicates = torch.matmul(kernel, premise.transpose(-1, -2))
-        predicates = predicates.permute(0, 1, 3, 2)
-        return predicates
-
-
+# trans (t): B <- B x B
 class CompositionOperator(LogicOperator):
     def __init__(self, config, arity):
         super().__init__(config, arity)
@@ -1177,132 +506,6 @@ class CompositionOperator(LogicOperator):
         return output_predicates
 
 
-class ChartOperator(LogicOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 1
-        predicate_dims = config.predicate_dims
-        self.max_span = config.max_span
-        self.span_dim = config.span_dim
-        self.all_size = self.max_span * self.span_dim
-        self.reader = nn.ModuleList([
-            nn.Identity(),
-            nn.Linear(predicate_dims[1], self.all_size*2),
-            nn.Identity()
-        ])
-        self.writer = nn.Linear(self.all_size, predicate_dims[1])
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        fwd, bwd = self._gather_index(self.max_span)
-        fwd = fwd.view((1,1)+fwd.shape+(1,))
-        bwd = bwd.view((1,1)+bwd.shape+(1,))
-        self.register_buffer("fwd", fwd)
-        self.register_buffer("bwd", bwd)
-
-    def _gather_index(self, D):
-        fwd = [
-            [tau-t if tau-t >= 0 and tau-t < D else D for tau in range(2*D)]
-            for t in range(D)
-        ]
-        bwd = [[t+delta for delta in range(D)] for t in range(D)]
-        return torch.tensor(fwd), torch.tensor(bwd)
-
-    def _gather(self, x, index, padding=0.0):
-        pad_shape = x.shape[:2] + (1, x.shape[-1])
-        pad = torch.full((1,1,1,1), padding, device=x.device, dtype=x.dtype)
-        pad = pad.expand(*pad_shape)
-        x = torch.cat((x, pad), dim=2)
-        x = x.view((x.shape[0], -1, self.max_span) + x.shape[2:])
-        x = x.gather(3, index.expand(x.shape[:2] + (-1,-1) + x.shape[4:]))
-        return x
-
-    def _logic_op(self, input_predicates):
-        input_shape = input_predicates[1].shape
-        split_shape = input_shape[:-1] + (2, self.max_span, self.span_dim)
-        output_shape = input_shape[:-1] + (self.all_size,)
-        P = input_predicates[1].view(*split_shape)
-        L = P[:, :, 0, :, :]
-        R = P[:, :, 1, :, :]
-        R = R.roll(shifts=-1, dims=1)
-        L = self._gather(L, self.fwd, -1e4)
-        R = self._gather(R, self.fwd.roll(shifts=1, dims=3), 0.0)
-        L = L.permute(0,1,4,2,3)
-        R = R.permute(0,1,4,2,3)
-        L = nn.Softmax(dim=-1)(L)
-        L0 = L[:, :, :, :, :self.max_span]
-        L1 = L[:, :, :, :, self.max_span:]
-        R0 = R[:, :, :, :, :self.max_span]
-        R1 = R[:, :, :, :, self.max_span:]
-        Q0 = torch.matmul(L0, R0)
-        Q1 = torch.matmul(L0, R1)
-        Q1 = Q1 + torch.matmul(L1, R0.roll(shifts=-1, dims=1))
-        mask = [1]*(Q1.shape[1]-1) + [0]
-        mask = torch.tensor(mask, device=Q1.device, dtype=Q1.dtype)
-        Q1 = Q1 * mask.view((1, mask.shape[0], 1, 1, 1))
-        Q = torch.cat((Q0, Q1), dim=-1)
-        Q = Q.permute(0, 1, 3, 4, 2)
-        Q = Q.gather(3, self.bwd.expand(Q.shape[:2] + (-1,-1) + Q.shape[4:]))
-        output_predicates = Q.view(*output_shape)
-        return output_predicates
-
-
-class HeadOperator(LogicOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 1
-        predicate_dims = config.predicate_dims
-        self.num_heads = config.num_heads
-        self.head_size = config.head_size
-        self.all_size = self.num_heads * self.head_size
-        self.reader = nn.ModuleList([
-            nn.Identity(),
-            nn.Linear(
-                predicate_dims[1],
-                self.num_heads**2+self.all_size,
-                bias=False
-            ),
-            nn.Identity()
-        ])
-        self.writer = nn.Linear(self.all_size, predicate_dims[1])
-
-    def _logic_op(self, input_predicates):
-        predicates = input_predicates[1]
-        query = predicates[:, :, :self.num_heads**2]
-        query = query.view(query.shape[:-1] + (self.num_heads, self.num_heads))
-        query = F.relu(query)
-        key = predicates[:, :, self.num_heads**2:]
-        key = key.view(key.shape[:-1] + (self.num_heads, self.head_size))
-        predicates = torch.matmul(query, key)
-        output_predicates = predicates.view(predicates.shape[:-2]+(-1,))
-        return output_predicates
-
-
-class Head2Operator(LogicOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 2
-        predicate_dims = config.predicate_dims
-        self.num_heads = int(math.sqrt(predicate_dims[2]))
-        self.head_size = int(math.sqrt(predicate_dims[2]))
-        self.all_size = self.num_heads * self.head_size
-        self.reader = nn.ModuleList([
-            nn.Identity(),
-            nn.Identity(),
-            nn.Linear(predicate_dims[2], 2*self.all_size, bias=False),
-        ])
-        self.writer = nn.Linear(self.all_size, predicate_dims[2])
-
-    def _logic_op(self, input_predicates):
-        predicates = input_predicates[2]
-        query = predicates[:, :, :, :self.all_size]
-        query = query.view(query.shape[:-1] + (self.num_heads, self.num_heads))
-        query = F.relu(query)
-        key = predicates[:, :, :, self.all_size:]
-        key = key.view(key.shape[:-1] + (self.num_heads, self.head_size))
-        predicates = torch.matmul(query, key)
-        output_predicates = predicates.view(predicates.shape[:-2]+(-1,))
-        return output_predicates
-
-
 class ReGluOperator(nn.Module):
     def __init__(self, in_features, out_features):
         super().__init__()
@@ -1322,6 +525,7 @@ BOOLEAN = {
 }
 
 
+# bool (b): U <- U x U & B <- B x B
 class BooleanOperator(LogicOperator):
     def __init__(self, config, arity):
         super().__init__(config, arity)
@@ -1355,11 +559,11 @@ class BooleanOperator(LogicOperator):
     def _logic_op(self, input_predicates):
         predicates = input_predicates[self.arity]
         if self.arity == 2:
-            predicates_T = predicates.transpose(1, 2)
-            predicates = torch.cat((predicates, predicates_T), dim=3)
-            skip = self.clause_skip(predicates_T)
+            predicates_transp = predicates.transpose(1, 2)
+            predicates = torch.cat((predicates, predicates_transp), dim=3)
+            skip = self.clause_skip(predicates_transp)
         predicates = self.clause_in(predicates)
-        predicates = self.act_fun(predicates) # drop if ReGLU is used
+        predicates = self.act_fun(predicates)  # drop if ReGLU is used
         predicates = self.clause_out(predicates)
         if self.arity == 2:
             predicates = predicates + skip
@@ -1367,72 +571,35 @@ class BooleanOperator(LogicOperator):
         return output_predicates
 
 
-class PermutationOperator(LogicOperator):
-    def __init__(self, config, arity):
-        super().__init__(config, arity)
-        assert arity == 2 # only support binary for now
-        predicate_dims = config.predicate_dims
-        self.reader = nn.ModuleList([
-            nn.Identity() for _ in range(len(config.mixer_ops))
-        ])
-        self.writer = nn.Linear(predicate_dims[arity], predicate_dims[arity])
-
-    def _logic_op(self, input_predicates):
-        output_predicates = input_predicates[self.arity].transpose(1, 2)
-        return output_predicates
-
-
 OPS = {
     "cjoin": ConjugateJoinOperator,
     "join": JoinOperator,
-    "join_": JoinWithRpeOperator,
-    "scatter": ScatterOperator,
-    "scatter2": Scatter2Operator,
-    "gather": GatherOperator,
-    "gather2": Gather2Operator,
-    "lambda": LambdaOperator,
-    "expand": ExpandOperator,
     "mu": MuOperator,
-    "quantif": QuantificationOperator,
-    "reduce": ReduceOperator,
     "assoc": AssociativeOperator,
-    "assoc_": AssociativeWithRpeOperator,
-    "assoc+": AssociativeWithSoftmaxOperator,
-    "assoc*": AssociativeWithLayerNormOperator,
-    "link": LinkOperator,
-    "link*": LinkWithLayerNormOperator,
-    "link2": Link2Operator,
-    "link2*": Link2WithLayerNormOperator,
-    "reflec": ReflectionOperator,
-    "reflec*": ReflectionWithLayerNormOperator,
-    "fuse": FuseOperator,
     "prod": ProductOperator,
-    "prod+": ProductWithSoftmaxOperator,
-    "prod*": ProductWithLayerNormOperator,
     "trans": CompositionOperator,
-    "head": HeadOperator,
-    "head2": Head2Operator,
-    "chart": ChartOperator,
-    "perm": PermutationOperator,
     "bool": BooleanOperator,
 }
 
 
+# Put different neural logic operators into one module and make them interact
+# (read and write) with the residual streams. FOLNet is a dual-branch
+# architecture, which has two residual streams.
 class Deduction(nn.Module):
     def __init__(self, config, deduction_type=None):
         super().__init__()
         predicate_dims = config.predicate_dims
-        if config.mixer_ops[0] is None or len(config.mixer_ops[0])==0:
+        if config.mixer_ops[0] is None or len(config.mixer_ops[0]) == 0:
             ops_keys = {
                 "object": config.mixer_ops,
-                "permut": {0:None, 1:None, 2:("perm",)},
-                "predic": {0:None, 1:("bool",), 2:("bool",)}
+                "permut": {0: None, 1: None, 2: ("perm",)},
+                "predic": {0: None, 1: ("bool",), 2: ("bool",)}
             }[deduction_type]
         else:
             ops_keys = {
                 "object": config.mixer_ops,
-                "permut": {0:None, 1:None, 2:("perm",)},
-                "predic": {0:("bool",), 1:("bool",), 2:("bool",)}
+                "permut": {0: None, 1: None, 2: ("perm",)},
+                "predic": {0: ("bool",), 1: ("bool",), 2: ("bool",)}
             }[deduction_type]
         self.normalizers = nn.ModuleList(
             LayerNorm(
@@ -1470,6 +637,7 @@ class Deduction(nn.Module):
         return output_predicates
 
 
+# Multiple Deduction stages are chained together into a ReasonerLayer
 class ReasonerLayer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1492,6 +660,7 @@ class ReasonerLayer(nn.Module):
         return output_predicates
 
 
+# Multiple ReasonerLayers are chained together into a Reasoner
 class Reasoner(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1514,6 +683,10 @@ class Reasoner(nn.Module):
         return output_predicates
 
 
+# FOLNet is a cascading of Encoder and Reasoner, where the Encoder maps input
+# ids and the relative position ides into embeddings and the Reasoner performs
+# deduction process from basic predicates towards advanced predicates in the
+# probabilistic logit space.
 class FOLNet(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1538,43 +711,10 @@ class FOLNet(nn.Module):
         self.init_weights()
 
     def tie_weights(self):
-        if self.glob_branch:
-            for layer in self.reasoner.layers:
-                boolean_0 = layer.deducers[1].operators[0][0]
-                boolean_1 = layer.deducers[1].operators[1][0]
-                boolean_0.clause_in = boolean_1.clause_in
-                boolean_0.clause_out = boolean_1.clause_out
-            for layer in self.reasoner.layers:
-                glob_s, glob_n = [], []
-                for operators in layer.deducers[0].operators:
-                    for op in operators:
-                        if isinstance(op, GatherOperator):
-                            glob_s.append(op)
-                        elif isinstance(op, ScatterOperator):
-                            glob_s.append(op)
-                        elif isinstance(op, FuseOperator):
-                            glob_s.append(op)
-                        elif isinstance(op, ReflectionOperator):
-                            glob_n.append(op)
-                        elif isinstance(op, LinkOperator):
-                            glob_n.append(op)
-                for op in glob_s:
-                    op.premise = glob_s[0].premise
-                for op in glob_n:
-                    op.kernel = glob_n[0].kernel
-                    op.premise = glob_n[0].premise
-                del glob_s, glob_n
+        assert not self.glob_branch
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
-        elif isinstance(module, LayerNorm):
-            if module.bias is not None:
-                module.bias.data.zero_()
-            if module.weight is not None:
-                module.weight.data.fill_(1.0)
-        if isinstance(module, nn.Linear) and module.bias is not None:
-            module.bias.data.zero_()
+        init_model_weights(module, self.initializer_range)
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -1602,15 +742,7 @@ class PreTrainHeads(nn.Module):
         self.init_weights()
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
-        elif isinstance(module, LayerNorm):
-            if module.bias is not None:
-                module.bias.data.zero_()
-            if module.weight is not None:
-                module.weight.data.fill_(1.0)
-        if isinstance(module, nn.Linear) and module.bias is not None:
-            module.bias.data.zero_()
+        init_model_weights(module, self.initializer_range)
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -1628,15 +760,7 @@ class SequenceContrastivePreTrainHead(nn.Module):
         self.init_weights()
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
-        elif isinstance(module, LayerNorm):
-            if module.bias is not None:
-                module.bias.data.zero_()
-            if module.weight is not None:
-                module.weight.data.fill_(1.0)
-        if isinstance(module, nn.Linear) and module.bias is not None:
-            module.bias.data.zero_()
+        init_model_weights(module, self.initializer_range)
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -1646,6 +770,15 @@ class SequenceContrastivePreTrainHead(nn.Module):
         return embd_pool
 
 
+# The class for pretraining with different settings of losses. The output
+# linear layer is tied with the input embedding layer. It also allows for
+# loading from pretrained checkpoints.
+# - Input arguments:
+#   - tok_seq: the input token ids
+#   - token_type_ids: the token type ids indicating the sequence #1/#2
+#   - mlm_positions: the positions for the masked tokens
+#   - mlm_labels: the labels for MLM
+#   - nsp_label: the labels for NSP (or SOP)
 class FOLNetForPreTraining(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1704,26 +837,7 @@ class FOLNetForPreTraining(nn.Module):
         pretrained_model_path,
         config=None
     ):
-        if config is None:
-            pretrained_config_path = pretrained_model_path + '.cfg'
-            config = FOLNetConfig.from_pretrained(pretrained_config_path)
-        model = cls(config)
-        model_dict = model.state_dict()
-        pretrained_dict = torch.load(
-            pretrained_model_path + '.pt',
-            map_location=torch.device('cpu')
-        )
-        src_dict = {k:v for k, v in pretrained_dict.items() if k in model_dict}
-        model_dict.update(src_dict)
-        model.load_state_dict(model_dict)
-        s = model.state_dict()
-        unused_keys = [k for k in pretrained_dict.keys() if k not in model_dict]
-        uninit_keys = [k for k in model_dict.keys() if k not in pretrained_dict]
-        failed_keys = [k for k,v in src_dict.items() if torch.norm(v-s[k])>1e-6]
-        print("unused pretrained weights = {}".format(unused_keys))
-        print("randomly initialized weights = {}".format(uninit_keys))
-        print("unsuccessfully initialized weights = {}".format(failed_keys))
-        return model
+        return init_from_pretrained(cls, pretrained_model_path, config)
 
     def forward(
         self,
@@ -1775,6 +889,10 @@ class FOLNetForPreTraining(nn.Module):
         return outputs
 
 
+# The class for modeling FOLNet in the sequence classification setting. It can
+# be used for classifying a single sequence or for classifying a pair of
+# sequences. The embedding at [CLS] token will be used as the features for
+# predicting the label. It can also be used in the regression setting as well.
 class FOLNetForSeqClassification(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1782,10 +900,10 @@ class FOLNetForSeqClassification(nn.Module):
         self.folnet = FOLNet(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, config.num_classes)
-        if config.num_classes > 1: # classification
+        if config.num_classes > 1:  # classification
             self.output_mode = "classification"
             self.criterion = nn.CrossEntropyLoss(ignore_index=-1)
-        elif config.num_classes == 1: # regression
+        elif config.num_classes == 1:  # regression
             self.criterion = nn.MSELoss()
             self.output_mode = "regression"
         else:
@@ -1794,15 +912,7 @@ class FOLNetForSeqClassification(nn.Module):
         self.init_weights()
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
-        elif isinstance(module, LayerNorm):
-            if module.bias is not None:
-                module.bias.data.zero_()
-            if module.weight is not None:
-                module.weight.data.fill_(1.0)
-        if isinstance(module, nn.Linear) and module.bias is not None:
-            module.bias.data.zero_()
+        init_model_weights(module, self.initializer_range)
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -1810,29 +920,10 @@ class FOLNetForSeqClassification(nn.Module):
     @classmethod
     def from_pretrained(
         cls,
-        pretrained_model_path, # contains *.cfg (config) and *.pt (model)
-        config=None # if None, *.cfg (config) of this class shall be in path
+        pretrained_model_path,  # contains *.cfg (config) and *.pt (model)
+        config=None  # if None, *.cfg (config) of this class shall be in path
     ):
-        if config is None:
-            pretrained_config_path = pretrained_model_path + '.cfg'
-            config = FOLNetConfig.from_pretrained(pretrained_config_path)
-        model = cls(config)
-        model_dict = model.state_dict()
-        pretrained_dict = torch.load(
-            pretrained_model_path + '.pt',
-            map_location=torch.device('cpu')
-        )
-        src_dict = {k:v for k, v in pretrained_dict.items() if k in model_dict}
-        model_dict.update(src_dict)
-        model.load_state_dict(model_dict)
-        s = model.state_dict()
-        unused_keys = [k for k in pretrained_dict.keys() if k not in model_dict]
-        uninit_keys = [k for k in model_dict.keys() if k not in pretrained_dict]
-        failed_keys = [k for k,v in src_dict.items() if torch.norm(v.float()-s[k].float())>1e-6]
-        print("unused pretrained weights = {}".format(unused_keys))
-        print("randomly initialized weights = {}".format(uninit_keys))
-        print("unsuccessfully initialized weights = {}".format(failed_keys))
-        return model
+        return init_from_pretrained(cls, pretrained_model_path, config)
 
     def forward(
         self,
@@ -1860,6 +951,10 @@ class FOLNetForSeqClassification(nn.Module):
         return outputs
 
 
+# The model class that uses FOLNet for multiple-choice tasks. There would be
+# multiple streams, where each stream concatenates the passage, the question and
+# one option. A linear projection will be applied to each stream and the stream
+# with the highest score will be the predicted class.
 class FOLNetForMultipleChoice(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -1872,15 +967,7 @@ class FOLNetForMultipleChoice(nn.Module):
         self.init_weights()
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
-        elif isinstance(module, LayerNorm):
-            if module.bias is not None:
-                module.bias.data.zero_()
-            if module.weight is not None:
-                module.weight.data.fill_(1.0)
-        if isinstance(module, nn.Linear) and module.bias is not None:
-            module.bias.data.zero_()
+        init_model_weights(module, self.initializer_range)
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -1888,29 +975,10 @@ class FOLNetForMultipleChoice(nn.Module):
     @classmethod
     def from_pretrained(
         cls,
-        pretrained_model_path, # contains *.cfg (config) and *.pt (model)
-        config=None # if None, *.cfg (config) of this class shall be in path
+        pretrained_model_path,  # contains *.cfg (config) and *.pt (model)
+        config=None  # if None, *.cfg (config) of this class shall be in path
     ):
-        if config is None:
-            pretrained_config_path = pretrained_model_path + '.cfg'
-            config = FOLNetConfig.from_pretrained(pretrained_config_path)
-        model = cls(config)
-        model_dict = model.state_dict()
-        pretrained_dict = torch.load(
-            pretrained_model_path + '.pt',
-            map_location=torch.device('cpu')
-        )
-        src_dict = {k:v for k, v in pretrained_dict.items() if k in model_dict}
-        model_dict.update(src_dict)
-        model.load_state_dict(model_dict)
-        s = model.state_dict()
-        unused_keys = [k for k in pretrained_dict.keys() if k not in model_dict]
-        uninit_keys = [k for k in model_dict.keys() if k not in pretrained_dict]
-        failed_keys = [k for k,v in src_dict.items() if torch.norm(v-s[k])>1e-6]
-        print("unused pretrained weights = {}".format(unused_keys))
-        print("randomly initialized weights = {}".format(uninit_keys))
-        print("unsuccessfully initialized weights = {}".format(failed_keys))
-        return model
+        return init_from_pretrained(cls, pretrained_model_path, config)
 
     def forward(
         self,
@@ -1933,83 +1001,6 @@ class FOLNetForMultipleChoice(nn.Module):
             loss = self.criterion(prediction_, labels_)
             error = (labels_ != prediction_.argmax(dim=1)).float().mean()
             outputs = (loss.unsqueeze(-1), error.unsqueeze(-1)) + outputs
-        return outputs
-
-
-class FOLNetForZeroShotPrediction(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.num_classes = config.num_classes
-        self.folnet = FOLNet(config)
-        self.cls = PreTrainHeads(config)
-        self.vocab_size = config.vocab_size
-        self.tie_weights()
-
-    def get_input_embeddings(self):
-        return self.folnet.encoder.word_embd
-
-    def get_output_embeddings(self):
-        return self.cls.heads.predictions.decoder
-
-    def tie_weights(self):
-        input_embds = self.get_input_embeddings()
-        output_embds = self.get_output_embeddings()
-        self._tie_weights(output_embds, input_embds)
-
-    def _tie_weights(self, output_embds, input_embds):
-        output_embds.weight = input_embds.weight
-        if getattr(output_embds, "bias", None) is not None:
-            pad = output_embds.weight.shape[0] - output_embds.bias.shape[0]
-            output_embds.bias.data = F.pad(
-                output_embds.bias.data, (0, pad,), "constant", 0
-            )
-        if hasattr(output_embds, "out_features") \
-        and hasattr(input_embds, "num_embeddings"):
-            output_embds.out_features = input_embds.num_embeddings
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_path,
-        config=None
-    ):
-        if config is None:
-            pretrained_config_path = pretrained_model_path + '.cfg'
-            config = FOLNetConfig.from_pretrained(pretrained_config_path)
-        model = cls(config)
-        model_dict = model.state_dict()
-        pretrained_dict = torch.load(
-            pretrained_model_path + '.pt',
-            map_location=torch.device('cpu')
-        )
-        src_dict = {k:v for k, v in pretrained_dict.items() if k in model_dict}
-        model_dict.update(src_dict)
-        model.load_state_dict(model_dict)
-        s = model.state_dict()
-        unused_keys = [k for k in pretrained_dict.keys() if k not in model_dict]
-        uninit_keys = [k for k in model_dict.keys() if k not in pretrained_dict]
-        failed_keys = [k for k,v in src_dict.items() if torch.norm(v-s[k])>1e-6]
-        print("unused pretrained weights = {}".format(unused_keys))
-        print("randomly initialized weights = {}".format(uninit_keys))
-        print("unsuccessfully initialized weights = {}".format(failed_keys))
-        return model
-
-    def forward(
-        self,
-        input_ids=None,
-        token_type_ids=None,
-        mlm_positions=None,
-        option_ids=None,
-    ):
-        embd_seq, embd_pool, embd_rel = self.folnet(input_ids, token_type_ids)
-        if mlm_positions is not None:
-            dim = embd_seq.shape[2]
-            gather_index = mlm_positions.unsqueeze(-1).expand(-1, -1, dim)
-            embd_seq = embd_seq.gather(1, gather_index)
-        mlm_pred, nsp_pred = self.cls(embd_seq, embd_pool, embd_rel)
-        mlm_pred = mlm_pred.squeeze(-2)
-        prediction = mlm_pred.gather(1, option_ids)
-        outputs = (prediction,)
         return outputs
 
 
@@ -2063,7 +1054,9 @@ class SQuADHead(nn.Module):
             return start_logits, end_logits
 
 
-
+# The modeling class used for extractive question answering tasks. A linear
+# classifier is applied to the final embedding at each token position to
+# generate the prediction logits for each token position.
 class FOLNetForQuestionAnswering(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -2074,15 +1067,7 @@ class FOLNetForQuestionAnswering(nn.Module):
         self.init_weights()
 
     def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
-        elif isinstance(module, LayerNorm):
-            if module.bias is not None:
-                module.bias.data.zero_()
-            if module.weight is not None:
-                module.weight.data.fill_(1.0)
-        if isinstance(module, nn.Linear) and module.bias is not None:
-            module.bias.data.zero_()
+        init_model_weights(module, self.initializer_range)
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -2090,29 +1075,10 @@ class FOLNetForQuestionAnswering(nn.Module):
     @classmethod
     def from_pretrained(
         cls,
-        pretrained_model_path, # contains *.cfg (config) and *.pt (model)
-        config=None # if None, *.cfg (config) of this class shall be in path
+        pretrained_model_path,  # contains *.cfg (config) and *.pt (model)
+        config=None  # if None, *.cfg (config) of this class shall be in path
     ):
-        if config is None:
-            pretrained_config_path = pretrained_model_path + '.cfg'
-            config = FOLNetConfig.from_pretrained(pretrained_config_path)
-        model = cls(config)
-        model_dict = model.state_dict()
-        pretrained_dict = torch.load(
-            pretrained_model_path + '.pt',
-            map_location=torch.device('cpu')
-        )
-        src_dict = {k:v for k, v in pretrained_dict.items() if k in model_dict}
-        model_dict.update(src_dict)
-        model.load_state_dict(model_dict)
-        s = model.state_dict()
-        unused_keys = [k for k in pretrained_dict.keys() if k not in model_dict]
-        uninit_keys = [k for k in model_dict.keys() if k not in pretrained_dict]
-        failed_keys = [k for k,v in src_dict.items() if torch.norm(v.float()-s[k].float())>1e-6]
-        print("unused pretrained weights = {}".format(unused_keys))
-        print("randomly initialized weights = {}".format(uninit_keys))
-        print("unsuccessfully initialized weights = {}".format(failed_keys))
-        return model
+        return init_from_pretrained(cls, pretrained_model_path, config)
 
     def forward(
         self,

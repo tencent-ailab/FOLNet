@@ -1,7 +1,7 @@
 import csv
 import os
 import sys
-import json
+from .utils_data import InputExample, InputFeatures
 
 
 PROMPT = {
@@ -15,6 +15,7 @@ PROMPT = {
     "RTE": " ? [MASK] !! ",
     "FOLIO": " ? [MASK] ! ",
 }
+
 
 def prompt_text(task, text_a, text_b):
     text = "[CLS] "
@@ -65,59 +66,22 @@ def prompt_text(task, text_a, text_b):
     return text
 
 
-class InputExample(object):
-    """A single training/test example for simple sequence classification."""
-
-    def __init__(self, guid, text_a, text_b=None, label=None, prompted=None):
-        """Constructs a InputExample.
-
-        Args:
-            guid: Unique id for the example.
-            text_a: string. The untokenized text of the first sequence. For
-                    single sequence tasks, only this sequence must be specified.
-            text_b: (Optional) string. The untokenized text of the second
-                    sequence. Only must be specified for sequence pair tasks.
-            label: (Optional) string. The label of the example. This should be
-                   specified for train and dev examples, but not for test
-                   examples.
-        """
-        self.guid = guid
-        self.text_a = text_a
-        self.text_b = text_b
-        self.label = label
-        self.prompted = prompted
-
-
-class InputFeatures(object):
-    """A single set of features of data."""
-
-    def __init__(
-        self,
-        input_ids,
-        input_mask,
-        segment_ids,
-        label_id,
-        mlm_positions=None,
-        option_ids=None,
-    ):
-        self.input_ids = input_ids
-        self.input_mask = input_mask
-        self.segment_ids = segment_ids
-        self.label_id = label_id
-        self.mlm_positions = mlm_positions
-        self.option_ids = option_ids
-
-
 class DataProcessor(object):
     """Base class for data converters for sequence classification data sets."""
 
     def get_train_examples(self, data_dir):
         """Gets a collection of `InputExample`s for the train set."""
-        raise NotImplementedError()
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, "train.tsv")),
+            "train",
+        )
 
-    def get_dev_examples(self, data_dir):
+    def get_dev_examples(self, data_dir, dev_type='dev'):
         """Gets a collection of `InputExample`s for the dev set."""
-        raise NotImplementedError()
+        return self._create_examples(
+            self._read_tsv(os.path.join(data_dir, dev_type + ".tsv")),
+            dev_type,
+        )
 
     def get_labels(self):
         """Gets the list of labels for this data set."""
@@ -138,20 +102,6 @@ class DataProcessor(object):
 
 class MrpcProcessor(DataProcessor):
     """Processor for the MRPC data set (GLUE version)."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")),
-            "train",
-        )
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")),
-            "dev",
-        )
 
     def get_labels(self):
         """See base class."""
@@ -185,19 +135,9 @@ class MrpcProcessor(DataProcessor):
 class MnliProcessor(DataProcessor):
     """Processor for the MultiNLI data set (GLUE version)."""
 
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")),
-            "train",
-        )
-
     def get_dev_examples(self, data_dir, dev_type="dev_matched"):
         """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, dev_type+".tsv")),
-            dev_type,
-        )
+        super().get_dev_examples(data_dir, dev_type=dev_type)
 
     def get_labels(self):
         """See base class."""
@@ -231,20 +171,6 @@ class MnliProcessor(DataProcessor):
 class ColaProcessor(DataProcessor):
     """Processor for the CoLA data set (GLUE version)."""
 
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")),
-            "train",
-        )
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")),
-            "dev",
-        )
-
     def get_labels(self):
         """See base class."""
         return ["0", "1"]
@@ -273,20 +199,6 @@ class ColaProcessor(DataProcessor):
 
 class Sst2Processor(DataProcessor):
     """Processor for the SST-2 data set (GLUE version)."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")),
-            "train",
-        )
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")),
-            "dev",
-        )
 
     def get_labels(self):
         """See base class."""
@@ -318,20 +230,6 @@ class Sst2Processor(DataProcessor):
 
 class StsbProcessor(DataProcessor):
     """Processor for the STS-B data set (GLUE version)."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")),
-            "train"
-        )
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")),
-            "dev"
-        )
 
     def get_test_examples(self, data_dir):
         """See base class."""
@@ -372,20 +270,6 @@ class StsbProcessor(DataProcessor):
 class QnliProcessor(DataProcessor):
     """Processor for the QNLI data set (GLUE version)."""
 
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")),
-            "train",
-        )
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")),
-            "dev",
-        )
-
     def get_labels(self):
         """See base class."""
         return ["not_entailment", "entailment"]
@@ -417,20 +301,6 @@ class QnliProcessor(DataProcessor):
 
 class QqpProcessor(DataProcessor):
     """Processor for the QQP data set (GLUE version)."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")),
-            "train",
-        )
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")),
-            "dev",
-        )
 
     def get_labels(self):
         """See base class."""
@@ -464,68 +334,8 @@ class QqpProcessor(DataProcessor):
         return examples
 
 
-class RteProcessor(DataProcessor):
-    """Processor for the RTE data set (GLUE version)."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")),
-            "train",
-        )
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")),
-            "dev",
-        )
-
-    def get_labels(self):
-        """See base class."""
-        return ["not_entailment", "entailment"]
-
-    def get_label_words(self):
-        return ["No", "Yes"]
-
-    def _create_examples(self, lines, set_type):
-        """Creates examples for the training and dev sets."""
-        examples = []
-        for (i, line) in enumerate(lines):
-            if i == 0:
-                continue
-            guid = "%s-%s" % (set_type, i)
-            text_a = line[1]
-            text_b = line[2]
-            label = line[3]
-            examples.append(
-                InputExample(
-                    guid=guid,
-                    text_a=text_a,
-                    text_b=text_b,
-                    label=label,
-                    prompted=prompt_text("RTE", text_a, text_b)
-                )
-            )
-        return examples
-
-
 class WnliProcessor(DataProcessor):
     """Processor for the WNLI data set (GLUE version)."""
-
-    def get_train_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "train.tsv")),
-            "train",
-        )
-
-    def get_dev_examples(self, data_dir):
-        """See base class."""
-        return self._create_examples(
-            self._read_tsv(os.path.join(data_dir, "dev.tsv")),
-            "dev",
-        )
 
     def get_labels(self):
         """See base class."""
@@ -558,7 +368,7 @@ def convert_examples_to_features(examples, label_list, max_seq_length,
 
     num_exceed = 0
     features = []
-    for (ex_index, example) in enumerate(examples):
+    for (_, example) in enumerate(examples):
         tokens_a = tokenizer.tokenize(example.text_a)
         len_a = len(tokens_a)
 
@@ -636,71 +446,6 @@ def convert_examples_to_features(examples, label_list, max_seq_length,
     return features, label_map
 
 
-def convert_examples_to_zeroshot_features(
-    examples,
-    label_list,
-    label_words,
-    max_seq_length,
-    tokenizer
-):
-    output_mode = "classification" if len(label_list) > 1 else "regression"
-    label_map = {label: i for i, label in enumerate(label_list)}
-
-    num_exceed = 0
-    features = []
-    for (ex_index, example) in enumerate(examples):
-        # tokenize prompted text and convert into ids
-        tokens = tokenizer.tokenize(example.prompted)
-        num_exceed += (len(tokens) > max_seq_length)
-        orig_mask_position = tokens.index("[MASK]")
-        tokens_a = tokens[1:orig_mask_position]
-        tokens_b = tokens[orig_mask_position+1:-1]
-        while len(tokens_a) + len(tokens_b) > max_seq_length - 3:
-            if len(tokens_a) > len(tokens_b):
-                tokens_a.pop(0)
-            else:
-                tokens_b.pop(-1)
-        tokens = ["[CLS]"] + tokens_a + ["[MASK]"] + tokens_b + ["[SEP]"]
-        input_ids = tokenizer.convert_tokens_to_ids(tokens)
-        # generate other meta-info
-        mlm_positions = [tokens.index("[MASK]")]
-        input_mask = [1] * len(input_ids)
-        option_ids = [tokenizer.tokenize(s)[0] for s in label_words]
-        option_ids = tokenizer.convert_tokens_to_ids(option_ids)
-        sep_position = tokens.index("[SEP]")
-        segment_ids = [0]*(sep_position+1) + [1]*(len(tokens)-sep_position-1)
-        # Zero-pad up to the sequence length.
-        padding = [0] * (max_seq_length - len(input_ids))
-        input_ids += padding
-        input_mask += padding
-        segment_ids += padding
-        assert len(input_ids) == max_seq_length
-        assert len(input_mask) == max_seq_length
-        assert len(segment_ids) == max_seq_length
-        # generate label
-        if output_mode == "classification":
-            label_id = label_map[example.label]
-        elif output_mode == "regression":
-            label_id = float(example.label)
-        else:
-            raise KeyError(output_mode)
-        # pack all features into outputs
-        features.append(
-            InputFeatures(
-                input_ids=input_ids,
-                input_mask=input_mask,
-                segment_ids=segment_ids,
-                label_id=label_id,
-                mlm_positions=mlm_positions,
-                option_ids=option_ids
-            )
-        )
-    perc_exceed = num_exceed/len(examples)
-    print('#features', len(features))
-    print("#perc-exceed-seq={:.2%}(>{})".format(perc_exceed, max_seq_length))
-    return features, label_map
-
-
 def _truncate_seq_pair(tokens_a, tokens_b, max_length):
     """Truncates a sequence pair in place to the maximum length."""
 
@@ -726,6 +471,6 @@ PROCESSORS = {
     "sts-b": StsbProcessor,
     "qnli": QnliProcessor,
     "qqp": QqpProcessor,
-    "rte": RteProcessor,
-    "wnli": WnliProcessor,
+    "rte": QnliProcessor,  # RteProcessor is the same as QnliProcessor
+    "wnli": WnliProcessor
 }

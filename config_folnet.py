@@ -1,5 +1,8 @@
 import json
 
+
+# This class is used as the configuration of the FOLNet model, it contains the
+# basic model hyper-parameters as well as the architecture details
 class FOLNetConfig(object):
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -7,6 +10,8 @@ class FOLNetConfig(object):
 
     @classmethod
     def from_args(cls, args):
+        # the vocabulary size is rounded to be multiples of 8 to activate the
+        # use of the tensor cores in GPU so that it is more efficient
         args.padded_vocab_size = (int(args.vocab_size // 8) + 1) * 8
         config_dict = {
             # common params
@@ -45,14 +50,16 @@ class FOLNetConfig(object):
         }
         return cls(**config_dict)
 
+    # load configuration from saved file
     @classmethod
     def from_pretrained(cls, pretrained_config_path):
         with open(pretrained_config_path, 'r') as cfg_file:
             config = cls(**json.load(cfg_file))
-        mixer_ops = {int(r):v for r, v in config.mixer_ops.items()}
+        mixer_ops = {int(r): v for r, v in config.mixer_ops.items()}
         config.mixer_ops = mixer_ops
         return config
 
+    # set the interval attributes of the class
     def set_attr(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
